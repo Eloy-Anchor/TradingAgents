@@ -42,6 +42,18 @@ OUT_OF_GRAPH = ("portfolio", "reflector")
 MILLION = Decimal(1_000_000)
 
 
+def _top_node(metadata: dict) -> str | None:
+    """The top-level graph node a call ran under.
+
+    Analysts run as subgraphs, where ``langgraph_node`` is the inner node
+    (``agent``, ``wrap_up``), so read the outermost segment of the checkpoint
+    namespace (``Market Analyst:<id>|agent:<id>``) first.
+    """
+    ns = metadata.get("langgraph_checkpoint_ns") or ""
+    top = ns.split("|", 1)[0].split(":", 1)[0]
+    return top or metadata.get("langgraph_node")
+
+
 class SpendCapReached(RuntimeError):
     pass
 
@@ -129,7 +141,7 @@ class CostLedger(BaseCallbackHandler):
                 raise SpendCapReached(
                     f"estimated spend ${self._total:.4f} reached the ${self.max_usd} cap"
                 )
-            node = (metadata or {}).get("langgraph_node")
+            node = _top_node(metadata or {})
             team, role = NODE_ROLES.get(node, ("unknown", node)) if node else OUT_OF_GRAPH
             params = invocation_params or {}
             model = params.get("model") or params.get("model_name") or "unknown"
