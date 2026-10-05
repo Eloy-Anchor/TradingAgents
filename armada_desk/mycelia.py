@@ -7,6 +7,12 @@ about $0.11 a run:
 - ``/oracle/sentiment/btc/usd`` ($0.05), MSXI, a derivatives sentiment index with a regime
 - ``/oracle/stress/market`` ($0.05), MSSI, a market stress index with a regime
 
+The market analyst doesn't decide whether to buy: in the first iteration-2
+run it was offered the tool and never called it. So with ``registered`` the
+analyst buys on its first turn, before the model runs, and the result goes into
+its context with one line telling it to cite the values and regimes. The tool
+stays on offer and returns the same answer for free.
+
 Each response is saved as Mycelia sent it under ``<run dir>/mycelia/``, so
 ``python -m armada_desk.verify <run dir>`` can check its Ed25519 signature
 later, and each payment goes into the ledger under analysts at the amount
@@ -30,12 +36,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
 from armada_desk.ledger import CostLedger
 from armada_desk.payer import ArmadaPayer, PaymentError
 from tradingagents.agents.analysts import market_analyst
+from tradingagents.graph import setup as graph_setup
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
 
 logger = logging.getLogger(__name__)
@@ -156,6 +164,42 @@ class SignedMarketState:
         ])
 
 
+INSTRUCTION = (
+    "Mycelia Signal, a paid source, sold the desk this signed, live BTC market state for this "
+    "run (get_signed_market_state returns the same text at no extra cost). Cite these values and "
+    "regimes in your report, and say where they agree or disagree with the price history and "
+    "indicators:\n\n{data}"
+)
+
+
+def _read(state: SignedMarketState, trade_date: str) -> str:
+    try:
+        return state(trade_date)
+    except Exception as exc:  # an exception out of a tool or node would end the run
+        logger.warning("%s failed: %s", TOOL_NAME, exc)
+        return f"Mycelia Signal is unavailable for this run ({type(exc).__name__})."
+
+
+def with_market_state(create_analyst, state: SignedMarketState):
+    """Wrap the market analyst's factory so each of its turns starts with the Mycelia data.
+
+    The first turn buys it; later turns reuse that answer. The note goes right
+    after the run's opening message, at the same place every turn, so the
+    analyst's own tool calls and results follow it as before.
+    """
+    def create(llm):
+        node = create_analyst(llm)
+
+        def market_analyst_node(graph_state):
+            note = HumanMessage(INSTRUCTION.format(data=_read(state, graph_state.get("trade_date", ""))))
+            messages = list(graph_state["messages"])
+            return node({**graph_state, "messages": [*messages[:1], note, *messages[1:]]})
+
+        return market_analyst_node
+
+    return create
+
+
 def make_tool(state: SignedMarketState):
     @tool(TOOL_NAME)
     def get_signed_market_state(
@@ -165,31 +209,32 @@ def make_tool(state: SignedMarketState):
 
         Returns the BTC/USD median price across about 10 exchanges, the MSXI
         derivatives sentiment index with its regime label, and the MSSI market
-        stress index with its regime label. Call it once; it costs about $0.11.
+        stress index with its regime label. Bought once per run; calling it
+        again returns the same answer at no extra cost.
         """
-        try:
-            return state(trade_date)
-        except Exception as exc:  # an exception out of a tool would end the run
-            logger.warning("%s failed: %s", TOOL_NAME, exc)
-            return f"Mycelia Signal is unavailable for this run ({type(exc).__name__})."
+        return _read(state, trade_date)
 
     return get_signed_market_state
 
 
 @contextmanager
-def registered(extra_tool):
-    """Offer ``extra_tool`` to the market analyst while the block runs.
+def registered(state: SignedMarketState):
+    """Give the market analyst the Mycelia data and tool while the block runs.
 
     The market analyst reads its tools from ``market_analyst.TOOLS`` on every
-    turn, and its tool node is built from the analyst's spec when the graph is
-    set up, so both change for the length of the block, graph setup and run.
+    turn, its tool node is built from the analyst's spec, and its node from
+    ``create_market_analyst`` when the graph is set up, so all three change for
+    the length of the block, graph setup and run.
     """
     spec = ANALYST_NODE_SPECS["market"]
     tools = market_analyst.TOOLS
-    market_analyst.TOOLS = (*tools, extra_tool)
+    create = graph_setup.create_market_analyst
+    market_analyst.TOOLS = (*tools, make_tool(state))
     ANALYST_NODE_SPECS["market"] = replace(spec, tools=market_analyst.TOOLS)
+    graph_setup.create_market_analyst = with_market_state(create, state)
     try:
         yield
     finally:
         market_analyst.TOOLS = tools
         ANALYST_NODE_SPECS["market"] = spec
+        graph_setup.create_market_analyst = create

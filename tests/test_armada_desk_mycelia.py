@@ -373,11 +373,51 @@ def test_market_analyst_calls_the_tool_in_a_full_run(tmp_path, monkeypatch, offl
 
     ledger, payer = CostLedger({}), FakePayer()
     state = mycelia.SignedMarketState(payer, tmp_path / "run", ledger, run_id="r1", today=e2e.TRADE_DATE)
-    with mycelia.registered(mycelia.make_tool(state)):
+    with mycelia.registered(state):
         graph = e2e._graph(tmp_path, monkeypatch, e2e.ScriptedModel())
-        final, _ = graph.propagate("NVDA", e2e.TRADE_DATE)
+        graph.propagate("NVDA", e2e.TRADE_DATE)
 
-    assert len(payer.keys) == 3
+    assert len(payer.keys) == 3   # bought once, though the model also called the tool
     assert sorted(p.name for p in (tmp_path / "run" / "mycelia").iterdir()) == [
         "price-btc-usd.json", "sentiment-btc-usd.json", "stress-market.json"]
     assert ledger.summary()["by_team"]["analysts"]["usd"] == "0.11"
+
+
+@pytest.mark.unit
+def test_market_analyst_buys_and_sees_the_data_without_calling_the_tool(tmp_path, monkeypatch, offline):  # noqa: F811
+    """Run B of iteration 2: the model never called the tool. The purchase can't depend on it."""
+    from tests import test_graph_end_to_end as e2e
+
+    prompts: list[str] = []
+
+    class NoTools(e2e.ScriptedModel):
+        def bind_tools(self, tools, **kwargs):
+            return self   # answers straight away, never calls a tool
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            prompts.append("\n".join(str(m.content) for m in messages))
+            return super()._generate(messages, stop, run_manager, **kwargs)
+
+    ledger, payer = CostLedger({}), FakePayer()
+    state = mycelia.SignedMarketState(payer, tmp_path / "run", ledger, run_id="r1", today=e2e.TRADE_DATE)
+    with mycelia.registered(state):
+        graph = e2e._graph(tmp_path, monkeypatch, NoTools())
+        graph.propagate("NVDA", e2e.TRADE_DATE)
+
+    assert len(payer.keys) == 3
+    assert ledger.summary()["data_usd"] == "0.11"
+    market = [p for p in prompts if "get_signed_market_state" in p and "Cite these values" in p]
+    assert len(market) == 1   # only the market analyst gets it
+    assert "$85,633.84" in market[0] and "regime NEUTRAL" in market[0] and "regime CALM" in market[0]
+
+
+@pytest.mark.unit
+def test_registered_restores_the_market_analyst():
+    from tradingagents.graph import setup as graph_setup
+
+    create, tools, spec = graph_setup.create_market_analyst, market_analyst.TOOLS, ANALYST_NODE_SPECS["market"]
+    state = mycelia.SignedMarketState(FakePayer(), Path("/nonexistent"), None, run_id="r1")
+    with mycelia.registered(state):
+        assert graph_setup.create_market_analyst is not create
+        assert market_analyst.TOOLS[-1].name == mycelia.TOOL_NAME
+    assert (graph_setup.create_market_analyst, market_analyst.TOOLS, ANALYST_NODE_SPECS["market"]) == (create, tools, spec)

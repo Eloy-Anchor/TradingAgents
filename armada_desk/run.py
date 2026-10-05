@@ -9,9 +9,9 @@ are only ever read from the environment, never written anywhere.
 With only ``--key-env`` every team uses that one key. ``--team-key-env
 research=RESEARCH_KEY`` (repeatable) gives a team its own key.
 
-``--mycelia`` (BTC-USD only) gives the market analyst ``get_signed_market_state``,
-which buys signed BTC data from Mycelia Signal through Armada with the
-analysts' key (about $0.11 a run) and saves the signed responses under
+``--mycelia`` (BTC-USD only) has the market analyst buy signed BTC data from
+Mycelia Signal through Armada with the analysts' key (about $0.11 a run) at the
+start of its turn, puts it in its context, and saves the signed responses under
 ``<out>/mycelia/``; check them with ``python -m armada_desk.verify <out>``.
 ``--no-mycelia``, the default, leaves the tool out.
 
@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         payer = ArmadaPayer(envs["analysts"], mcp_url=args.mcp_url, budget_id=args.mycelia_budget_id)
         payer.budget_id()   # a free call: a bad key or missing budget stops here, before any spend
         state = mycelia.SignedMarketState(payer, out, ledger, run_id=out.name)
-        extra = mycelia.registered(mycelia.make_tool(state))
+        extra = mycelia.registered(state)
 
     with extra:
         graph = TradingAgentsGraph(selected_analysts=ANALYSTS, config=cfg, callbacks=[ledger])
