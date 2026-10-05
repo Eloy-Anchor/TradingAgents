@@ -9,6 +9,12 @@ are only ever read from the environment, never written anywhere.
 With only ``--key-env`` every team uses that one key. ``--team-key-env
 research=RESEARCH_KEY`` (repeatable) gives a team its own key.
 
+``--mycelia`` (BTC-USD only) gives the market analyst ``get_signed_market_state``,
+which buys signed BTC data from Mycelia Signal through Armada with the
+analysts' key (about $0.11 a run) and saves the signed responses under
+``<out>/mycelia/``; check them with ``python -m armada_desk.verify <out>``.
+``--no-mycelia``, the default, leaves the tool out.
+
 Prints one JSON line with the decision and the estimated cost by team and role,
 and writes the same summary plus every priced call to ``<out>/ledger.json``.
 """
@@ -16,6 +22,7 @@ and writes the same summary plus every priced call to ``<out>/ledger.json``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import sys
@@ -26,7 +33,9 @@ from pathlib import Path
 
 import requests
 
+from armada_desk import mycelia
 from armada_desk.ledger import CostLedger, SpendCapReached
+from armada_desk.payer import MCP_URL, ArmadaPayer
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.team_llms import TEAMS
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -67,7 +76,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--quick", default=QUICK)
     ap.add_argument("--deep", default=DEEP)
     ap.add_argument("--out", default=None, help="run directory (default ~/.tradingagents/armada/<ts>)")
+    ap.add_argument("--mycelia", action=argparse.BooleanOptionalAction, default=False,
+                    help="let the market analyst buy signed BTC data from Mycelia Signal (~$0.11)")
+    ap.add_argument("--mcp-url", default=MCP_URL, help="Armada's MCP endpoint, for --mycelia")
+    ap.add_argument("--mycelia-budget-id", default=None,
+                    help="budget to pay Mycelia from (default: the analysts agent's first budget)")
     args = ap.parse_args(argv)
+    if args.mycelia and args.ticker != "BTC-USD":
+        raise SystemExit("--mycelia buys BTC data, so it needs --ticker BTC-USD")
 
     models = fetch_models(args.base_url)
     for m in (args.quick, args.deep):
@@ -92,16 +108,24 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     ledger = CostLedger(models, max_usd=args.max_usd)
-    graph = TradingAgentsGraph(selected_analysts=ANALYSTS, config=cfg, callbacks=[ledger])
+    extra = contextlib.nullcontext()
+    if args.mycelia:
+        # Paid with the analysts' agent, whose allowlist has Mycelia Signal.
+        payer = ArmadaPayer(envs["analysts"], mcp_url=args.mcp_url, budget_id=args.mycelia_budget_id)
+        payer.budget_id()   # a free call: a bad key or missing budget stops here, before any spend
+        state = mycelia.SignedMarketState(payer, out, ledger, run_id=out.name)
+        extra = mycelia.registered(mycelia.make_tool(state))
 
-    started = time.monotonic()
-    status, signal, error = "ok", None, None
-    try:
-        _, signal = graph.propagate(args.ticker, args.date, asset_type="crypto")
-    except SpendCapReached as exc:
-        status, error = "spend_cap_reached", str(exc)
-    except Exception as exc:  # report what was spent before the failure
-        status, error = "error", f"{type(exc).__name__}: {exc}"
+    with extra:
+        graph = TradingAgentsGraph(selected_analysts=ANALYSTS, config=cfg, callbacks=[ledger])
+        started = time.monotonic()
+        status, signal, error = "ok", None, None
+        try:
+            _, signal = graph.propagate(args.ticker, args.date, asset_type="crypto")
+        except SpendCapReached as exc:
+            status, error = "spend_cap_reached", str(exc)
+        except Exception as exc:  # report what was spent before the failure
+            status, error = "error", f"{type(exc).__name__}: {exc}"
 
     summary = {
         "status": status,
@@ -112,11 +136,12 @@ def main(argv: list[str] | None = None) -> int:
         "seconds": round(time.monotonic() - started, 1),
         "models": {"quick": args.quick, "deep": args.deep},
         "max_usd": str(args.max_usd),
+        "mycelia": args.mycelia,
         "out": str(out),
         **ledger.summary(),
     }
     (out / "ledger.json").write_text(json.dumps(summary, indent=2))
-    printable = {k: v for k, v in summary.items() if k != "records"}
+    printable = {k: v for k, v in summary.items() if k not in ("records", "payments")}
     print(json.dumps(printable))
     return 0 if status == "ok" else 1
 

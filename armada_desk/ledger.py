@@ -8,6 +8,10 @@ spend on its Armada page.
 
 It also carries a spend guard: once the estimated total reaches ``max_usd``,
 the next model call raises ``SpendCapReached`` before it is sent.
+
+Data the desk buys over x402 (Mycelia Signal) goes in with
+``record_payment``, at the amount Armada says it paid, so those totals are
+real, not estimates, and they count towards ``max_usd``.
 """
 
 from __future__ import annotations
@@ -70,6 +74,17 @@ class CallRecord:
     usd: str
 
 
+@dataclass
+class PaymentRecord:
+    team: str
+    role: str
+    merchant: str
+    url: str
+    usd: str
+    transaction_id: str | None = None
+    amount_known: bool = True   # False: Armada's transaction list didn't show it, so usd is 0
+
+
 def _price_tier(entry: dict, input_tokens: int) -> dict:
     """The pricing that applies at this input length (long-context tiers)."""
     pricing = entry["pricing"]
@@ -125,6 +140,7 @@ class CostLedger(BaseCallbackHandler):
         self.models = models
         self.max_usd = max_usd
         self.calls: list[CallRecord] = []
+        self.payments: list[PaymentRecord] = []
         self.unpriced: list[str] = []
         self._pending: dict[Any, tuple[str, str, str]] = {}
         self._total = Decimal(0)
@@ -164,22 +180,40 @@ class CostLedger(BaseCallbackHandler):
         with self._lock:
             self._pending.pop(run_id, None)
 
+    def record_payment(self, team: str, role: str, merchant: str, url: str,
+                       usd: Decimal | None, transaction_id: str | None = None) -> None:
+        """A data purchase, at the amount Armada paid (None if it couldn't be read)."""
+        with self._lock:
+            self._total += usd or Decimal(0)
+            self.payments.append(PaymentRecord(team, role, merchant, url, str(usd or Decimal(0)),
+                                               transaction_id, usd is not None))
+
     def summary(self) -> dict:
         def roll(key: str) -> dict:
             out: dict[str, dict] = {}
+
+            def row(name: str) -> dict:
+                return out.setdefault(name, {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                                             "payments": 0, "usd": Decimal(0)})
+
             for c in self.calls:
-                row = out.setdefault(getattr(c, key), {
-                    "calls": 0, "input_tokens": 0, "output_tokens": 0, "usd": Decimal(0)})
-                row["calls"] += 1
-                row["input_tokens"] += c.input_tokens
-                row["output_tokens"] += c.output_tokens
-                row["usd"] += Decimal(c.usd)
+                r = row(getattr(c, key))
+                r["calls"] += 1
+                r["input_tokens"] += c.input_tokens
+                r["output_tokens"] += c.output_tokens
+                r["usd"] += Decimal(c.usd)
+            for p in self.payments:
+                r = row(getattr(p, key))
+                r["payments"] += 1
+                r["usd"] += Decimal(p.usd)
             return {k: {**v, "usd": str(v["usd"])}
                     for k, v in sorted(out.items(), key=lambda kv: -kv[1]["usd"])}
 
         return {
             "total_usd": str(self._total),
             "calls": len(self.calls),
+            "data_usd": str(sum((Decimal(p.usd) for p in self.payments), Decimal(0))),
+            "payments": [asdict(p) for p in self.payments],
             "by_team": roll("team"),
             "by_role": roll("role"),
             "unpriced_models": sorted(set(self.unpriced)),
